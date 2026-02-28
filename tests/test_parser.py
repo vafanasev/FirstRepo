@@ -65,3 +65,21 @@ def test_parse_headerless_class_based_table_extracts_key_fields():
     assert row["repute_ru"] == "Плохое"
     assert row["genes"] == "ABO"
     assert "blood group" in row["summary"].lower()
+
+
+def test_standard_like_detail_block_preferred_over_not_tested_rows():
+    df = parse_promethease_report("sample_data/report_fixture_5.html")
+    assert not df.empty
+
+    assert "rs1333049" in {x.lower() for x in df["rsID"].astype(str)}
+    row = df[df["rsID"].str.lower() == "rs1333049"].iloc[0]
+    assert row["genotype"] in {"C;C", "C/C"}
+    assert row["magnitude"] == 4.0
+    assert row["repute"] == "bad"
+    assert row["repute_ru"] == "Плохое"
+    assert "coronary" in row["summary"].lower()
+
+    # low-information 'not tested' rows should be removed when informative rows exist
+    ids = {x.lower() for x in df["rsID"].astype(str)}
+    assert "rs7466519" not in ids
+    assert "i5007171" not in ids

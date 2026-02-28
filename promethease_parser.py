@@ -100,8 +100,7 @@ def _extract_headers(table) -> list[str]:
 
 
 def _find_data_tables(soup: BeautifulSoup):
-    tables = soup.find_all("table")
-    for table in tables:
+    for table in soup.find_all("table"):
         headers = _extract_headers(table)
         header_line = " ".join(headers)
         table_text = table.get_text(" ", strip=True).lower()
@@ -137,10 +136,7 @@ def _parse_by_header(header: str, value: str, cell, row: dict[str, object]) -> N
 
 def _cell_signature(cell) -> str:
     classes = " ".join(cell.get("class", []))
-    attrs = " ".join(
-        str(cell.get(k, ""))
-        for k in ("data-title", "data-label", "aria-label", "title")
-    )
+    attrs = " ".join(str(cell.get(k, "")) for k in ("data-title", "data-label", "aria-label", "title"))
     return f"{classes} {attrs}".lower()
 
 
@@ -154,7 +150,7 @@ def _parse_row_heuristics(cells, row: dict[str, object]) -> None:
             row["rsID"] = rs_match.group(0)
 
     if not row["genotype"]:
-        gt_match = re.search(r"\(([ACGTDI;-]{1,7})\)", joined, flags=re.IGNORECASE)
+        gt_match = re.search(r"\(([ACGTDI;/-]{1,10})\)", joined, flags=re.IGNORECASE)
         if gt_match:
             row["genotype"] = gt_match.group(1).replace(";", "/")
 
@@ -176,7 +172,6 @@ def _parse_row_heuristics(cells, row: dict[str, object]) -> None:
                 break
 
     if not row["summary"] and cells:
-        # Prefer longest non-rsid textual cell as description.
         best = ""
         for c in cells:
             t = _text(c)
@@ -208,7 +203,6 @@ def _parse_row(cells, headers: list[str]) -> dict[str, object]:
         if idx < len(headers):
             _parse_by_header(headers[idx], value, cell, row)
 
-        # Fallback on class/data-* semantic hints.
         if "gene" in signature and not row["genes"]:
             row["genes"] = value
         if "geno" in signature and not row["genotype"]:
@@ -224,7 +218,6 @@ def _parse_row(cells, headers: list[str]) -> dict[str, object]:
         if ("snp" in signature or "link" in signature) and not row["snpedia_link"]:
             row["snpedia_link"] = _extract_link(cell) or value
 
-        # Always try rsID and link detection from each cell text/link.
         if not row["rsID"]:
             rs_match = RSID_PATTERN.search(value)
             if rs_match:
@@ -232,10 +225,104 @@ def _parse_row(cells, headers: list[str]) -> dict[str, object]:
                 row["snpedia_link"] = row["snpedia_link"] or _extract_link(cell)
 
     _parse_row_heuristics(cells, row)
-
     row["repute"] = str(row["repute"] or "unknown").lower()
     row["repute_ru"] = map_repute_to_ru(row["repute"])
     return row
+
+
+def _new_row() -> dict[str, object]:
+    return {
+        "rsID": "",
+        "genotype": "",
+        "magnitude": 0.0,
+        "repute": "unknown",
+        "summary": "",
+        "genes": "",
+        "snpedia_link": "",
+        "source": "",
+        "repute_ru": "Неизвестно",
+    }
+
+
+def _extract_pairs_from_tables(container) -> dict[str, str]:
+    pairs: dict[str, str] = {}
+    for tr in container.find_all("tr"):
+        cells = tr.find_all(["td", "th"])
+        if len(cells) < 2:
+            continue
+        left = _text(cells[0]).strip()
+        right = _text(cells[1]).strip()
+        if not left or not right:
+            continue
+        left_l = left.lower()
+        right_l = right.lower()
+        # supports both "Label | Value" and "Value | Label"
+        if right_l in {"repute", "magnitude", "frequency", "genes", "gene", "summary", "description", "source"}:
+            pairs[right_l] = left
+        if left_l in {"repute", "magnitude", "frequency", "genes", "gene", "summary", "description", "source"}:
+            pairs[left_l] = right
+    return pairs
+
+
+def _extract_rows_from_detail_blocks(soup: BeautifulSoup) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for container in soup.find_all(["section", "article", "div"]):
+        title_tag = container.find(["h1", "h2", "h3", "h4", "a"], string=RSID_PATTERN)
+        if title_tag is None:
+            continue
+
+        title_text = _text(title_tag)
+        rs_match = RSID_PATTERN.search(title_text)
+        if rs_match is None:
+            continue
+
+        row = _new_row()
+        row["rsID"] = rs_match.group(0)
+
+        gt_match = re.search(r"\(([ACGTDI;/-]{1,10})\)", title_text, flags=re.IGNORECASE)
+        if gt_match:
+            row["genotype"] = gt_match.group(1).replace(";", "/")
+
+        pairs = _extract_pairs_from_tables(container)
+        if "magnitude" in pairs:
+            row["magnitude"] = normalize_magnitude(pairs["magnitude"])
+        if "repute" in pairs:
+            row["repute"] = pairs["repute"].lower()
+        if "gene" in pairs and not row["genes"]:
+            row["genes"] = pairs["gene"]
+        if "genes" in pairs and not row["genes"]:
+            row["genes"] = pairs["genes"]
+        if "summary" in pairs and not row["summary"]:
+            row["summary"] = pairs["summary"]
+        if "description" in pairs and not row["summary"]:
+            row["summary"] = pairs["description"]
+        if "source" in pairs:
+            row["source"] = pairs["source"]
+
+        if not row["summary"]:
+            best_par = ""
+            for p in container.find_all(["p", "li"]):
+                t = _text(p)
+                if len(t) > len(best_par):
+                    best_par = t
+            row["summary"] = best_par
+
+        row["snpedia_link"] = "https://www.snpedia.com/index.php/" + str(row["rsID"])
+        row["repute"] = str(row["repute"] or "unknown").lower()
+        row["repute_ru"] = map_repute_to_ru(row["repute"])
+        rows.append(row)
+    return rows
+
+
+def _is_low_information(row: pd.Series) -> bool:
+    summary = str(row.get("summary", "") or "").strip().lower()
+    return (
+        normalize_magnitude(row.get("magnitude", 0.0)) == 0.0
+        and str(row.get("genotype", "") or "").strip() == ""
+        and str(row.get("genes", "") or "").strip() == ""
+        and str(row.get("repute", "unknown") or "unknown").strip().lower() == "unknown"
+        and summary in {"", "not tested", "not set"}
+    )
 
 
 def parse_promethease_html_bytes(html_bytes: bytes) -> pd.DataFrame:
@@ -248,13 +335,14 @@ def parse_promethease_html_bytes(html_bytes: bytes) -> pd.DataFrame:
             cells = tr.find_all(["td", "th"])
             if not cells:
                 continue
-
             if tr.find("th") and tr.find("td") is None:
                 continue
 
             row = _parse_row(cells, headers)
             if row["rsID"]:
                 parsed_rows.append(row)
+
+    parsed_rows.extend(_extract_rows_from_detail_blocks(soup))
 
     df = pd.DataFrame(parsed_rows)
     if df.empty:
@@ -265,7 +353,15 @@ def parse_promethease_html_bytes(html_bytes: bytes) -> pd.DataFrame:
             df[col] = "" if col != "magnitude" else 0.0
 
     df["magnitude"] = df["magnitude"].apply(normalize_magnitude)
+    df["repute"] = df["repute"].astype(str).str.lower()
+    df["repute_ru"] = df["repute"].apply(map_repute_to_ru)
+
     df = df.drop_duplicates(subset=["rsID", "genotype", "summary"], keep="first")
+
+    low_mask = df.apply(_is_low_information, axis=1)
+    if (~low_mask).any():
+        df = df[~low_mask]
+
     df = df.sort_values(by="magnitude", ascending=False).reset_index(drop=True)
     return df[REQUIRED_COLUMNS]
 
