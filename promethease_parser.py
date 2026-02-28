@@ -307,12 +307,54 @@ def _extract_rows_from_detail_blocks(soup: BeautifulSoup) -> list[dict[str, obje
                     best_par = t
             row["summary"] = best_par
 
-        row["snpedia_link"] = "https://www.snpedia.com/index.php/" + str(row["rsID"])
+        if not row["magnitude"] and row["summary"]:
+            row["magnitude"] = _infer_magnitude_from_summary(str(row["summary"]))
+
         row["repute"] = str(row["repute"] or "unknown").lower()
+        if row["repute"] == "unknown" and row["summary"]:
+            row["repute"] = _infer_repute_from_summary(str(row["summary"]))
+
+        row["snpedia_link"] = "https://www.snpedia.com/index.php/" + str(row["rsID"])
         row["repute_ru"] = map_repute_to_ru(row["repute"])
         rows.append(row)
     return rows
 
+
+
+
+def _infer_repute_from_summary(summary: str) -> str:
+    text = summary.lower()
+    if any(x in text for x in ("increased risk", "higher risk", "risk for", "susceptibility", "pathogenic")):
+        return "bad"
+    if any(x in text for x in ("decreased risk", "protective", "beneficial", "improved response")):
+        return "good"
+    if "neutral" in text:
+        return "neutral"
+    return "unknown"
+
+
+def _infer_magnitude_from_summary(summary: str) -> float:
+    text = summary.lower().replace(",", ".")
+    m = re.search(r"(\d+(?:\.\d+)?)\s*x\s*(?:increased|decreased)?\s*risk", text)
+    if m:
+        return normalize_magnitude(m.group(1))
+    return 0.0
+
+
+def _row_quality(row: pd.Series) -> float:
+    score = 0.0
+    if str(row.get("genotype", "") or "").strip():
+        score += 1.0
+    mag = normalize_magnitude(row.get("magnitude", 0.0))
+    if mag > 0:
+        score += 3.0 + min(mag, 10.0) * 0.05
+    rep = str(row.get("repute", "unknown") or "unknown").strip().lower()
+    if rep in {"bad", "good", "neutral"}:
+        score += 2.0
+    if str(row.get("genes", "") or "").strip():
+        score += 1.0
+    score += min(len(str(row.get("summary", "") or "")), 300) / 300.0
+    return score
 
 def _is_low_information(row: pd.Series) -> bool:
     summary = str(row.get("summary", "") or "").strip().lower()
@@ -356,13 +398,24 @@ def parse_promethease_html_bytes(html_bytes: bytes) -> pd.DataFrame:
     df["repute"] = df["repute"].astype(str).str.lower()
     df["repute_ru"] = df["repute"].apply(map_repute_to_ru)
 
-    df = df.drop_duplicates(subset=["rsID", "genotype", "summary"], keep="first")
+    # Prefer richer rows when the same rsID appears both in flat tables and detail cards.
+    df["_quality"] = df.apply(_row_quality, axis=1)
+    df = df.sort_values(by=["rsID", "_quality"], ascending=[True, False])
+    df = df.drop_duplicates(subset=["rsID", "genotype"], keep="first")
+
+    # Fill missing core fields from summary heuristics.
+    missing_mag = df["magnitude"].apply(normalize_magnitude) == 0.0
+    df.loc[missing_mag, "magnitude"] = df.loc[missing_mag, "summary"].astype(str).apply(_infer_magnitude_from_summary)
+
+    unknown_rep = df["repute"].astype(str).str.lower().eq("unknown")
+    df.loc[unknown_rep, "repute"] = df.loc[unknown_rep, "summary"].astype(str).apply(_infer_repute_from_summary)
+    df["repute_ru"] = df["repute"].apply(map_repute_to_ru)
 
     low_mask = df.apply(_is_low_information, axis=1)
     if (~low_mask).any():
         df = df[~low_mask]
 
-    df = df.sort_values(by="magnitude", ascending=False).reset_index(drop=True)
+    df = df.sort_values(by=["magnitude", "_quality"], ascending=False).drop(columns=["_quality"]).reset_index(drop=True)
     return df[REQUIRED_COLUMNS]
 
 

@@ -83,3 +83,11 @@ def test_standard_like_detail_block_preferred_over_not_tested_rows():
     ids = {x.lower() for x in df["rsID"].astype(str)}
     assert "rs7466519" not in ids
     assert "i5007171" not in ids
+
+
+def test_duplicate_rsid_prefers_informative_detail_row():
+    df = parse_promethease_report("sample_data/report_fixture_6.html")
+    row = df[df["rsID"].str.lower() == "rs1333049"].iloc[0]
+    assert row["magnitude"] >= 1.9
+    assert row["repute"] == "bad"
+    assert "increased risk" in row["summary"].lower()
