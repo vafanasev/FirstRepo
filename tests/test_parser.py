@@ -52,3 +52,16 @@ def test_smoke_parser_not_empty_and_columns_present():
     assert not df.empty
     for col in ["rsID", "genotype", "magnitude", "repute_ru", "summary"]:
         assert col in df.columns
+
+
+def test_parse_headerless_class_based_table_extracts_key_fields():
+    df = parse_promethease_report("sample_data/report_fixture_4.html")
+    assert len(df) == 2
+
+    row = df[df["rsID"].str.lower() == "rs8176746"].iloc[0]
+    assert row["genotype"] in {"A;G", "A/G"}
+    assert row["magnitude"] == 2.8
+    assert row["repute"] == "bad"
+    assert row["repute_ru"] == "Плохое"
+    assert row["genes"] == "ABO"
+    assert "blood group" in row["summary"].lower()

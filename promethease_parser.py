@@ -28,6 +28,8 @@ REQUIRED_COLUMNS = [
     "source",
 ]
 
+RSID_PATTERN = re.compile(r"\b(?:rs\d+|i\d+)\b", flags=re.IGNORECASE)
+
 
 def load_report_bytes(path: str | Path) -> bytes:
     """Load report bytes from .html/.htm or .zip (largest html inside)."""
@@ -67,9 +69,34 @@ def map_repute_to_ru(repute: object) -> str:
     return REPUTE_RU_MAP.get(key, "Неизвестно")
 
 
+def _text(cell) -> str:
+    return cell.get_text(" ", strip=True)
+
+
+def _extract_link(cell) -> str:
+    for a_tag in cell.find_all("a", href=True):
+        href = a_tag["href"].strip()
+        if "snpedia.com" in href:
+            return href
+    a_tag = cell.find("a", href=True)
+    return a_tag["href"].strip() if a_tag else ""
+
+
 def _extract_headers(table) -> list[str]:
-    headers = [h.get_text(" ", strip=True).lower() for h in table.find_all("th")]
-    return headers
+    thead_tr = table.select_one("thead tr")
+    if thead_tr:
+        header_cells = thead_tr.find_all(["th", "td"])
+        return [c.get_text(" ", strip=True).lower() for c in header_cells]
+
+    for tr in table.find_all("tr"):
+        th_cells = tr.find_all("th")
+        td_cells = tr.find_all("td")
+        if th_cells and (not td_cells) and len(th_cells) > 1:
+            return [c.get_text(" ", strip=True).lower() for c in th_cells]
+        if th_cells and td_cells and len(th_cells) == len(td_cells):
+            return [c.get_text(" ", strip=True).lower() for c in th_cells]
+
+    return []
 
 
 def _find_data_tables(soup: BeautifulSoup):
@@ -77,20 +104,92 @@ def _find_data_tables(soup: BeautifulSoup):
     for table in tables:
         headers = _extract_headers(table)
         header_line = " ".join(headers)
-        if "rsid" in header_line or "genotype" in header_line or "magnitude" in header_line:
+        table_text = table.get_text(" ", strip=True).lower()
+        if (
+            "rsid" in header_line
+            or "genotype" in header_line
+            or "magnitude" in header_line
+            or "snpedia" in table_text
+            or RSID_PATTERN.search(table_text)
+        ):
             yield table
 
 
-def _extract_link(cell) -> str:
-    a_tag = cell.find("a", href=True)
-    return a_tag["href"].strip() if a_tag else ""
+def _parse_by_header(header: str, value: str, cell, row: dict[str, object]) -> None:
+    if "rsid" in header or header == "snp":
+        row["rsID"] = value
+        row["snpedia_link"] = row["snpedia_link"] or _extract_link(cell)
+    elif "genotype" in header:
+        row["genotype"] = value
+    elif "magnitude" in header:
+        row["magnitude"] = normalize_magnitude(value)
+    elif "repute" in header:
+        row["repute"] = value.lower() if value else "unknown"
+    elif "summary" in header or "description" in header:
+        row["summary"] = value
+    elif "gene" in header:
+        row["genes"] = value
+    elif "snpedia" in header or "link" in header:
+        row["snpedia_link"] = _extract_link(cell) or value
+    elif "source" in header or "section" in header:
+        row["source"] = value
 
 
-def _text(cell) -> str:
-    return cell.get_text(" ", strip=True)
+def _cell_signature(cell) -> str:
+    classes = " ".join(cell.get("class", []))
+    attrs = " ".join(
+        str(cell.get(k, ""))
+        for k in ("data-title", "data-label", "aria-label", "title")
+    )
+    return f"{classes} {attrs}".lower()
 
 
-def _parse_row_by_headers(cells, headers: list[str]) -> dict[str, object]:
+def _parse_row_heuristics(cells, row: dict[str, object]) -> None:
+    joined = " ".join(_text(c) for c in cells)
+    joined_lower = joined.lower()
+
+    if not row["rsID"]:
+        rs_match = RSID_PATTERN.search(joined)
+        if rs_match:
+            row["rsID"] = rs_match.group(0)
+
+    if not row["genotype"]:
+        gt_match = re.search(r"\(([ACGTDI;-]{1,7})\)", joined, flags=re.IGNORECASE)
+        if gt_match:
+            row["genotype"] = gt_match.group(1).replace(";", "/")
+
+    if not row["magnitude"]:
+        mag_match = re.search(r"(?:magnitude|mag)\s*[:=]?\s*([-+]?\d*[\.,]?\d+)", joined_lower)
+        if mag_match:
+            row["magnitude"] = normalize_magnitude(mag_match.group(1))
+
+    if row["repute"] == "unknown":
+        rep_match = re.search(r"\b(bad|good|neutral)\b", joined_lower)
+        if rep_match:
+            row["repute"] = rep_match.group(1)
+
+    if not row["snpedia_link"]:
+        for c in cells:
+            link = _extract_link(c)
+            if link:
+                row["snpedia_link"] = link
+                break
+
+    if not row["summary"] and cells:
+        # Prefer longest non-rsid textual cell as description.
+        best = ""
+        for c in cells:
+            t = _text(c)
+            if not t:
+                continue
+            if RSID_PATTERN.fullmatch(t):
+                continue
+            if len(t) > len(best):
+                best = t
+        row["summary"] = best
+
+
+def _parse_row(cells, headers: list[str]) -> dict[str, object]:
     row = {
         "rsID": "",
         "genotype": "",
@@ -103,49 +202,39 @@ def _parse_row_by_headers(cells, headers: list[str]) -> dict[str, object]:
     }
 
     for idx, cell in enumerate(cells):
-        if idx >= len(headers):
-            continue
-        header = headers[idx]
         value = _text(cell)
+        signature = _cell_signature(cell)
 
-        if "rsid" in header or header == "snp":
-            row["rsID"] = value
-            if not row["snpedia_link"]:
-                row["snpedia_link"] = _extract_link(cell)
-        elif "genotype" in header:
-            row["genotype"] = value
-        elif "magnitude" in header:
-            row["magnitude"] = normalize_magnitude(value)
-        elif "repute" in header:
-            row["repute"] = value.lower() if value else "unknown"
-        elif "summary" in header or "description" in header:
-            row["summary"] = value
-        elif "gene" in header:
+        if idx < len(headers):
+            _parse_by_header(headers[idx], value, cell, row)
+
+        # Fallback on class/data-* semantic hints.
+        if "gene" in signature and not row["genes"]:
             row["genes"] = value
-        elif "snpedia" in header or "link" in header:
-            row["snpedia_link"] = _extract_link(cell) or value
-        elif "source" in header or "section" in header:
+        if "geno" in signature and not row["genotype"]:
+            row["genotype"] = value
+        if "magnitude" in signature and not row["magnitude"]:
+            row["magnitude"] = normalize_magnitude(value)
+        if "repute" in signature and row["repute"] == "unknown":
+            row["repute"] = value.lower() if value else "unknown"
+        if ("summary" in signature or "desc" in signature) and not row["summary"]:
+            row["summary"] = value
+        if ("source" in signature or "section" in signature) and not row["source"]:
             row["source"] = value
+        if ("snp" in signature or "link" in signature) and not row["snpedia_link"]:
+            row["snpedia_link"] = _extract_link(cell) or value
 
-    if not row["rsID"]:
-        for cell in cells:
-            txt = _text(cell)
-            match = re.search(r"\brs\d+\b", txt, flags=re.IGNORECASE)
-            if match:
-                row["rsID"] = match.group(0)
+        # Always try rsID and link detection from each cell text/link.
+        if not row["rsID"]:
+            rs_match = RSID_PATTERN.search(value)
+            if rs_match:
+                row["rsID"] = rs_match.group(0)
                 row["snpedia_link"] = row["snpedia_link"] or _extract_link(cell)
-                break
 
-    if row["repute"] == "unknown":
-        joined = " ".join(_text(c).lower() for c in cells)
-        for rep in ("bad", "good", "neutral"):
-            if re.search(rf"\b{rep}\b", joined):
-                row["repute"] = rep
-                break
+    _parse_row_heuristics(cells, row)
 
-    if not row["summary"] and len(cells) >= 4:
-        row["summary"] = _text(cells[-1])
-
+    row["repute"] = str(row["repute"] or "unknown").lower()
+    row["repute_ru"] = map_repute_to_ru(row["repute"])
     return row
 
 
@@ -155,18 +244,16 @@ def parse_promethease_html_bytes(html_bytes: bytes) -> pd.DataFrame:
 
     for table in _find_data_tables(soup):
         headers = _extract_headers(table)
-        body_rows = table.find_all("tr")
-        for tr in body_rows:
+        for tr in table.find_all("tr"):
             cells = tr.find_all(["td", "th"])
             if not cells:
                 continue
+
             if tr.find("th") and tr.find("td") is None:
                 continue
 
-            row = _parse_row_by_headers(cells, headers)
+            row = _parse_row(cells, headers)
             if row["rsID"]:
-                row["repute"] = str(row["repute"] or "unknown").lower()
-                row["repute_ru"] = map_repute_to_ru(row["repute"])
                 parsed_rows.append(row)
 
     df = pd.DataFrame(parsed_rows)
@@ -175,7 +262,7 @@ def parse_promethease_html_bytes(html_bytes: bytes) -> pd.DataFrame:
 
     for col in REQUIRED_COLUMNS:
         if col not in df.columns:
-            df[col] = "" if col not in {"magnitude"} else 0.0
+            df[col] = "" if col != "magnitude" else 0.0
 
     df["magnitude"] = df["magnitude"].apply(normalize_magnitude)
     df = df.drop_duplicates(subset=["rsID", "genotype", "summary"], keep="first")
